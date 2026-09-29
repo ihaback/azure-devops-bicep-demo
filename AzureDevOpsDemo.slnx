@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="AzureDevOpsDemo.Web/AzureDevOpsDemo.Web.csproj" />
+  <Project Path="AzureDevOpsDemo.Tests/AzureDevOpsDemo.Tests.csproj" />
+</Solution>

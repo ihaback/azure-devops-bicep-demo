@@ -1,0 +1,17 @@
+@model AzureDevOpsDemo.Web.Models.KeyVaultStatusViewModel
+
+@{
+    ViewData["Title"] = "Key Vault status";
+}
+
+<section>
+    <h1>Key Vault status</h1>
+    <p>Key Vault: @(Model.KeyVaultConnected ? "Connected" : "Not connected")</p>
+
+    @if (Model.KeyVaultConnected)
+    {
+        <p>Key Vault value: @Model.KeyVaultValue</p>
+    }
+</section>
+
+<!-- Render only a deliberately non-sensitive demonstration value. -->

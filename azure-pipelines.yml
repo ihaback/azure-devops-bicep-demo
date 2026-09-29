@@ -1,0 +1,218 @@
+# CI/CD for AzureDevOpsDemo with isolated test and production environments.
+trigger:
+  branches:
+    include:
+    - develop
+    - main
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  dotnetSdkVersion: '10.0.x'
+  buildConfiguration: 'Release'
+  solutionPath: 'AzureDevOpsDemo.slnx'
+  webProjectPath: 'AzureDevOpsDemo.Web/AzureDevOpsDemo.Web.csproj'
+  artifactName: 'webapp'
+  runtimeStack: 'DOTNETCORE|10.0'
+
+  testAzureServiceConnection: 'azure-azuredevopsdemo-test'
+  testEnvironmentName: 'AzureDevOpsDemo-Test'
+  testResourceGroupName: 'rg-azuredevopsdemo-test'
+  testParametersFile: 'infra/main.test.bicepparam'
+
+  productionAzureServiceConnection: 'azure-azuredevopsdemo-production'
+  productionEnvironmentName: 'AzureDevOpsDemo-Production'
+  productionResourceGroupName: 'rg-azuredevopsdemo-prod'
+  productionParametersFile: 'infra/main.prod.bicepparam'
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build solution and validate infrastructure
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+      inputs:
+        packageType: sdk
+        version: $(dotnetSdkVersion)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build $(buildConfiguration)'
+      inputs:
+        command: build
+        projects: $(solutionPath)
+        arguments: '--configuration $(buildConfiguration)'
+
+    - bash: az bicep build --file "$(Build.SourcesDirectory)/infra/main.bicep"
+      displayName: Validate Bicep template
+
+- stage: Test
+  displayName: Test
+  dependsOn: Build
+  jobs:
+  - job: Test
+    displayName: Run automated tests
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+      inputs:
+        packageType: sdk
+        version: $(dotnetSdkVersion)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Test $(buildConfiguration)'
+      inputs:
+        command: test
+        projects: $(solutionPath)
+        arguments: '--configuration $(buildConfiguration)'
+        publishTestResults: true
+
+- stage: Publish
+  displayName: Publish
+  dependsOn: Test
+  jobs:
+  - job: Publish
+    displayName: Publish web application
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+      inputs:
+        packageType: sdk
+        version: $(dotnetSdkVersion)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish $(buildConfiguration)'
+      inputs:
+        command: publish
+        publishWebProjects: false
+        projects: $(webProjectPath)
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/publish'
+        zipAfterPublish: false
+        modifyOutputPath: false
+
+    - task: ArchiveFiles@2
+      displayName: Archive published application
+      inputs:
+        rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/publish'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+
+    - publish: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+      displayName: Publish pipeline artifact
+      artifact: $(artifactName)
+
+- stage: DeployTest
+  displayName: Deploy to Test
+  dependsOn: Publish
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: DeployTest
+    displayName: Deploy test environment
+    environment: $(testEnvironmentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - download: none
+
+          - task: AzureCLI@2
+            displayName: Deploy test infrastructure
+            inputs:
+              azureSubscription: $(testAzureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                webAppName=$(az deployment group create \
+                  --name "azuredevopsdemo-test-$(Build.BuildId)" \
+                  --resource-group "$(testResourceGroupName)" \
+                  --parameters "$(Build.SourcesDirectory)/$(testParametersFile)" \
+                  --query "properties.outputs.webAppName.value" \
+                  --output tsv)
+
+                if [ -z "$webAppName" ]; then
+                  echo "##vso[task.logissue type=error]The Bicep deployment did not return a Web App name."
+                  exit 1
+                fi
+
+                echo "Deployed test Web App: $webAppName"
+                echo "##vso[task.setvariable variable=deployedWebAppName]$webAppName"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download application artifact
+            inputs:
+              buildType: current
+              artifactName: $(artifactName)
+              targetPath: '$(Pipeline.Workspace)/$(artifactName)'
+
+          - task: AzureRmWebAppDeployment@5
+            displayName: Deploy application to test App Service
+            inputs:
+              ConnectionType: AzureRM
+              azureSubscription: $(testAzureServiceConnection)
+              appType: webAppLinux
+              WebAppName: $(deployedWebAppName)
+              packageForLinux: '$(Pipeline.Workspace)/$(artifactName)/$(Build.BuildId).zip'
+              RuntimeStack: $(runtimeStack)
+              DeploymentTypeLinux: zipDeploy
+
+- stage: DeployProduction
+  displayName: Deploy to Production
+  dependsOn: Publish
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployProduction
+    displayName: Deploy production environment
+    environment: $(productionEnvironmentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - download: none
+
+          - task: AzureCLI@2
+            displayName: Deploy production infrastructure
+            inputs:
+              azureSubscription: $(productionAzureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                webAppName=$(az deployment group create \
+                  --name "azuredevopsdemo-prod-$(Build.BuildId)" \
+                  --resource-group "$(productionResourceGroupName)" \
+                  --parameters "$(Build.SourcesDirectory)/$(productionParametersFile)" \
+                  --query "properties.outputs.webAppName.value" \
+                  --output tsv)
+
+                if [ -z "$webAppName" ]; then
+                  echo "##vso[task.logissue type=error]The Bicep deployment did not return a Web App name."
+                  exit 1
+                fi
+
+                echo "Deployed production Web App: $webAppName"
+                echo "##vso[task.setvariable variable=deployedWebAppName]$webAppName"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download application artifact
+            inputs:
+              buildType: current
+              artifactName: $(artifactName)
+              targetPath: '$(Pipeline.Workspace)/$(artifactName)'
+
+          - task: AzureRmWebAppDeployment@5
+            displayName: Deploy application to production App Service
+            inputs:
+              ConnectionType: AzureRM
+              azureSubscription: $(productionAzureServiceConnection)
+              appType: webAppLinux
+              WebAppName: $(deployedWebAppName)
+              packageForLinux: '$(Pipeline.Workspace)/$(artifactName)/$(Build.BuildId).zip'
+              RuntimeStack: $(runtimeStack)
+              DeploymentTypeLinux: zipDeploy
